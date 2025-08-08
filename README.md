@@ -7,6 +7,7 @@
 - DHT22
 - HDC1080
 - DS3231
+- DS18B20
 
 ## Humidity
 - DHT22
