@@ -19,6 +19,7 @@ void ds3231_set_uart_handle(UART_HandleTypeDef *handle)
 	ds3231_uart_handle = handle;
 }
 
+// FIXME: after code refactoring this function should be reworked
 static void ds3231_update_time(char *cmd)
 {
 	datetime_t current_time;
@@ -42,6 +43,7 @@ static void ds3231_update_time(char *cmd)
     }
 }
 
+// FIXME: after code refactoring this function should be reworked
 static void ds3231_sent_time_to_host()
 {
 	volatile datetime_t current_time;
@@ -66,6 +68,7 @@ static void ds3231_process_uart_command(char *cmd)
     }
 }
 
+// FIXME: after code refactoring this function should be reworked
 int ds3231_configure_loop()
 {
     static uint16_t idx = 0;
