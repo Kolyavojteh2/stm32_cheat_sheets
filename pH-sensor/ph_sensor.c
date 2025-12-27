@@ -1,56 +1,5 @@
 #include "ph_sensor.h"
-
-static uint32_t ph_sensor_get_adc_rank(void)
-{
-#if defined(ADC_RANK_CHANNEL_NUMBER)
-    return ADC_RANK_CHANNEL_NUMBER;
-#else
-    return 1;
-#endif
-}
-
-static PH_Sensor_Status_t ph_sensor_adc_read_channel(PH_Sensor_t *self,
-                                                     uint32_t channel,
-                                                     uint32_t sampling_time,
-                                                     uint16_t *raw_out)
-{
-    ADC_ChannelConfTypeDef sConfig;
-
-    if (self == NULL || self->hadc == NULL || raw_out == NULL) {
-        return PH_SENSOR_STATUS_INVALID_PARAM;
-    }
-
-    sConfig.Channel = channel;
-    sConfig.Rank = ph_sensor_get_adc_rank();
-
-#if defined(ADC_SAMPLETIME_1CYCLE_5) || defined(ADC_SAMPLETIME_7CYCLES_5)
-    sConfig.SamplingTime = sampling_time;
-#else
-    /* If HAL variant differs, you must adjust this field for your MCU family. */
-    sConfig.SamplingTime = sampling_time;
-#endif
-
-    if (HAL_ADC_ConfigChannel(self->hadc, &sConfig) != HAL_OK) {
-        return PH_SENSOR_STATUS_HAL_ERROR;
-    }
-
-    if (HAL_ADC_Start(self->hadc) != HAL_OK) {
-        return PH_SENSOR_STATUS_HAL_ERROR;
-    }
-
-    if (HAL_ADC_PollForConversion(self->hadc, 10) != HAL_OK) {
-        (void)HAL_ADC_Stop(self->hadc);
-        return PH_SENSOR_STATUS_HAL_ERROR;
-    }
-
-    *raw_out = (uint16_t)HAL_ADC_GetValue(self->hadc);
-
-    if (HAL_ADC_Stop(self->hadc) != HAL_OK) {
-        return PH_SENSOR_STATUS_HAL_ERROR;
-    }
-
-    return PH_SENSOR_STATUS_OK;
-}
+#include "ph_adc_hal.h"
 
 PH_Sensor_Status_t ph_sensor_init(PH_Sensor_t *self,
                                   ADC_HandleTypeDef *hadc,
@@ -63,24 +12,26 @@ PH_Sensor_Status_t ph_sensor_init(PH_Sensor_t *self,
         return PH_SENSOR_STATUS_INVALID_PARAM;
     }
 
-    self->hadc = hadc;
-    self->ph_adc_channel = ph_adc_channel;
-    self->ph_adc_sampling_time = ph_adc_sampling_time;
-
-    self->has_temp_channel = false;
-    self->temp_adc_channel = 0;
-    self->temp_adc_sampling_time = 0;
-
-    self->has_do_pin = false;
-
     if (adc_max == 0U) {
         return PH_SENSOR_STATUS_INVALID_PARAM;
     }
-    self->adc_max = adc_max;
 
     if (vref <= 0.0f) {
         return PH_SENSOR_STATUS_INVALID_PARAM;
     }
+
+    self->hadc = hadc;
+
+    self->ph_adc_channel = ph_adc_channel;
+    self->ph_adc_sampling_time = ph_adc_sampling_time;
+
+    self->has_temp_channel = false;
+    self->temp_adc_channel = 0U;
+    self->temp_adc_sampling_time = 0U;
+
+    self->has_do_pin = false;
+
+    self->adc_max = adc_max;
     self->vref = vref;
 
     ph_sensor_calib_reset(&self->calib);
@@ -165,10 +116,14 @@ PH_Sensor_Status_t ph_sensor_read_raw(PH_Sensor_t *self, uint16_t *raw_out)
         return PH_SENSOR_STATUS_INVALID_PARAM;
     }
 
-    return ph_sensor_adc_read_channel(self,
-                                      self->ph_adc_channel,
-                                      self->ph_adc_sampling_time,
-                                      raw_out);
+    if (ph_adc_hal_read(self->hadc,
+                        self->ph_adc_channel,
+                        self->ph_adc_sampling_time,
+                        raw_out) != HAL_OK) {
+        return PH_SENSOR_STATUS_HAL_ERROR;
+    }
+
+    return PH_SENSOR_STATUS_OK;
 }
 
 PH_Sensor_Status_t ph_sensor_read_voltage(PH_Sensor_t *self, float *voltage_out)
@@ -269,10 +224,14 @@ PH_Sensor_Status_t ph_sensor_read_temp_raw(PH_Sensor_t *self, uint16_t *raw_out)
         return PH_SENSOR_STATUS_INVALID_PARAM;
     }
 
-    return ph_sensor_adc_read_channel(self,
-                                      self->temp_adc_channel,
-                                      self->temp_adc_sampling_time,
-                                      raw_out);
+    if (ph_adc_hal_read(self->hadc,
+                        self->temp_adc_channel,
+                        self->temp_adc_sampling_time,
+                        raw_out) != HAL_OK) {
+        return PH_SENSOR_STATUS_HAL_ERROR;
+    }
+
+    return PH_SENSOR_STATUS_OK;
 }
 
 PH_Sensor_Status_t ph_sensor_read_temp_voltage(PH_Sensor_t *self, float *voltage_out)

@@ -6,8 +6,6 @@
 
 /* Calibration model:
    pH = slope * voltage + offset
-
-   Voltage is expected in volts (V).
 */
 typedef struct {
     float slope;

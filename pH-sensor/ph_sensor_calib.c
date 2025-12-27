@@ -1,13 +1,12 @@
 #include "ph_sensor_calib.h"
 
-static bool ph_sensor_isfinite_float(float x)
+static bool ph_sensor_calib_isfinite_float(float x)
 {
-    /* Minimal check without <math.h> dependency.
-       This rejects NaN by comparing with itself.
-    */
+    /* Minimal NaN check without <math.h> */
     if (x != x) {
         return false;
     }
+
     return true;
 }
 
@@ -34,9 +33,9 @@ bool ph_sensor_calib_set_two_point(PH_Sensor_Calib_t *calib,
         return false;
     }
 
-    if (!ph_sensor_isfinite_float(v1) || !ph_sensor_isfinite_float(v2) ||
-        !ph_sensor_isfinite_float(ph1) || !ph_sensor_isfinite_float(ph2) ||
-        !ph_sensor_isfinite_float(calibration_temp_c)) {
+    if (!ph_sensor_calib_isfinite_float(v1) || !ph_sensor_calib_isfinite_float(v2) ||
+        !ph_sensor_calib_isfinite_float(ph1) || !ph_sensor_calib_isfinite_float(ph2) ||
+        !ph_sensor_calib_isfinite_float(calibration_temp_c)) {
         return false;
     }
 
@@ -86,7 +85,7 @@ bool ph_sensor_calib_voltage_to_ph_tc(const PH_Sensor_Calib_t *calib,
         return false;
     }
 
-    if (!ph_sensor_isfinite_float(temperature_c)) {
+    if (!ph_sensor_calib_isfinite_float(temperature_c)) {
         return false;
     }
 
