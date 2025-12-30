@@ -89,6 +89,17 @@ void example(void) {
 }
 ```
 
+```
+#include "ds3231.h"
+#include "ds3231_time_bridge.h"
+
+DS3231_t rtc;
+
+ds3231_init(&rtc, &hi2c1, 0x68);
+ds3231_time_bridge_attach(&rtc);
+
+```
+
 ## How to set the current time in RTC
 To do this, you need to additionally copy the ds3231_configure.* API, but this is only needed to load the time to the RTC once.
 ### Steps to set the current time using UART
