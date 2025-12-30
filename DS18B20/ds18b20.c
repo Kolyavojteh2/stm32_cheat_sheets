@@ -1,288 +1,355 @@
-/*
- * ds18b20.c
- *
- *  Created on: Aug 8, 2025
- *      Author: vojt
- */
-
-#include <stdbool.h>
 #include "ds18b20.h"
 
-/* --- Retry policy --- */
-/* How many times to retry full read sequence on CRC failure */
-#ifndef DS18B20_MAX_RETRIES
-#define DS18B20_MAX_RETRIES (3)
-#endif
+/* 1-Wire commands */
+#define DS18B20_CMD_SKIP_ROM                (0xCCU)
+#define DS18B20_CMD_CONVERT_T               (0x44U)
+#define DS18B20_CMD_READ_SCRATCHPAD         (0xBEU)
+#define DS18B20_CMD_WRITE_SCRATCHPAD        (0x4EU)
+#define DS18B20_CMD_COPY_SCRATCHPAD         (0x48U)
 
-/* Delay between retries (ms) to let the bus settle */
-#ifndef DS18B20_RETRY_DELAY_MS
-#define DS18B20_RETRY_DELAY_MS (10)
-#endif
+/* Conversion delays in ms for 9..12-bit resolution */
+static const uint16_t ds18b20_conversion_delay_ms[4] = { 94U, 188U, 375U, 750U };
 
-/* ---- 1-Wire commands ---- */
-#define CMD_SKIP_ROM    (0xCC)
-#define CMD_CONVERT_T   (0x44)
-#define CMD_READ_SCR    (0xBE)
-#define CMD_WRITE_SCR   (0x4E)
-#define CMD_COPY_SCR    (0x48)
-
-// Delay times (ms) for resolutions 9..12 bits, indexed by DS18B20_RESOLUTION enum
-static uint32_t ds18b20_convertion_delay[] = { 94, 188, 375, 750 };
-
-static void DS18B20_delay_us(DS18B20_t *instance, uint32_t delay_us)
+/* Return 1 if pin mask is exactly one bit (single GPIO pin). */
+static inline uint8_t ds18b20_is_single_pin(uint16_t pin)
 {
-    /* Busy-wait using CNT. Works as long as us < timer period. */
-    uint32_t start = __HAL_TIM_GET_COUNTER(instance->timer);
-    while ((uint32_t)(__HAL_TIM_GET_COUNTER(instance->timer) - start) < delay_us)
+    return (pin != 0U && ((uint16_t)(pin & (uint16_t)(pin - 1U)) == 0U)) ? 1U : 0U;
+}
+
+/* Convert GPIO_PIN_x mask into 0..15 index. Assumes single pin. */
+static uint8_t ds18b20_pin_to_index(uint16_t pin)
+{
+    for (uint8_t i = 0U; i < 16U; i++)
     {
-    	__NOP();
-    }
-}
-
-/* Switch pin to output and drive low (simulate open-drain) */
-static inline void DS18B20_pin_drive_low(DS18B20_t *instance)
-{
-    GPIO_InitTypeDef io = {0};
-    io.Pin = instance->pin;
-    io.Mode = GPIO_MODE_OUTPUT_PP;  /* push-pull to force low */
-    io.Pull = GPIO_NOPULL;
-    io.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(instance->port, &io);
-    HAL_GPIO_WritePin(instance->port, instance->pin, GPIO_PIN_RESET);
-}
-
-/* Release line (input, external pull-up keeps it high) */
-static inline void DS18B20_pin_release(DS18B20_t *instance)
-{
-    GPIO_InitTypeDef io = {0};
-    io.Pin = instance->pin;
-    io.Mode = GPIO_MODE_INPUT;      /* Hi-Z */
-    io.Pull = GPIO_NOPULL;          /* external pull-up (typically 4.7kΩ, up to 10kΩ for short lines) */
-    HAL_GPIO_Init(instance->port, &io);
-}
-
-/* Read current level */
-static inline uint8_t DS18B20_read(DS18B20_t *instance)
-{
-    return (uint8_t)HAL_GPIO_ReadPin(instance->port, instance->pin);
-}
-
-/* 1-Wire reset + presence detect */
-static bool DS18B20_reset(DS18B20_t *instance)
-{
-	DS18B20_pin_drive_low(instance);
-	DS18B20_delay_us(instance, 500);  /* reset low ~480-500 us */
-	DS18B20_pin_release(instance);
-	DS18B20_delay_us(instance, 70);   /* wait before sampling presence */
-    bool presence = (DS18B20_read(instance) == 0);
-    DS18B20_delay_us(instance, 410);  /* finish presence window */
-    return presence;
-}
-
-static void DS18B20_write_bit(DS18B20_t *instance, uint8_t bit)
-{
-    if (bit)
-    {
-        /* Write '1': pull low ~6-10us, then release to end of slot (~60us) */
-    	DS18B20_pin_drive_low(instance);
-    	DS18B20_delay_us(instance, 6);
-    	DS18B20_pin_release(instance);
-    	DS18B20_delay_us(instance, 64);
-    }
-    else
-    {
-        /* Write '0': keep low ~60us */
-    	DS18B20_pin_drive_low(instance);
-    	DS18B20_delay_us(instance, 60);
-    	DS18B20_pin_release(instance);
-    	DS18B20_delay_us(instance, 10);
-    }
-}
-
-static void DS18B20_write_byte(DS18B20_t *instance, uint8_t data)
-{
-    for (int i = 0; i < 8; i++)
-    {
-    	DS18B20_write_bit(instance, data & 0x01);
-        data >>= 1;
-    }
-}
-
-static uint8_t DS18B20_read_bit(DS18B20_t *instance)
-{
-    uint8_t bit;
-    /* Read slot: pull low ~2us, release, sample ~15us from start */
-    DS18B20_pin_drive_low(instance);
-    DS18B20_delay_us(instance, 2);
-    DS18B20_pin_release(instance);
-    DS18B20_delay_us(instance, 13);
-    bit = DS18B20_read(instance);
-    /* complete slot to ~60us */
-    DS18B20_delay_us(instance, 45);
-    return bit;
-}
-
-static uint8_t DS18B20_read_byte(DS18B20_t *instance)
-{
-    uint8_t data = 0;
-    for (int i = 0; i < 8; i++)
-    {
-    	data >>= 1;
-        if (DS18B20_read_bit(instance))
-        	data |= 0x80;
-    }
-    return data;
-}
-
-/* Dallas/Maxim CRC8 */
-static uint8_t crc8_maxim(const uint8_t *data, uint8_t len)
-{
-    uint8_t crc = 0;
-    while (len--)
-    {
-        uint8_t inbyte = *data++;
-        for (uint8_t i = 0; i < 8; i++)
+        if (((uint16_t)(pin >> i) & 0x1U) != 0U)
         {
-            uint8_t mix = (crc ^ inbyte) & 0x01;
-            crc >>= 1;
-            if (mix) crc ^= 0x8C;
-            inbyte >>= 1;
+            return i;
         }
     }
+    return 0xFFU;
+}
+
+/* Busy-wait delay in microseconds using timer counter (1 tick = 1 us). */
+static void ds18b20_delay_us(const DS18B20_t *dev, uint32_t delay_us)
+{
+    uint32_t start = __HAL_TIM_GET_COUNTER(dev->htim);
+
+    while ((uint32_t)(__HAL_TIM_GET_COUNTER(dev->htim) - start) < delay_us)
+    {
+        __NOP();
+    }
+}
+
+/* Configure DQ as open-drain output and drive low. */
+static inline void ds18b20_dq_drive_low(DS18B20_t *dev)
+{
+    GPIO_TypeDef *port = dev->dq.port;
+    uint32_t pos2 = (uint32_t)dev->dq_pin_index * 2U;
+
+    /* Output mode */
+    port->MODER = (port->MODER & ~(0x3U << pos2)) | (0x1U << pos2);
+
+    /* Open-drain */
+    port->OTYPER |= (1U << dev->dq_pin_index);
+
+    /* No pull-up/down (external pull-up is expected) */
+    port->PUPDR &= ~(0x3U << pos2);
+
+    /* High speed */
+    port->OSPEEDR = (port->OSPEEDR & ~(0x3U << pos2)) | (0x3U << pos2);
+
+    /* Drive low */
+    port->BSRR = ((uint32_t)dev->dq.pin << 16U);
+}
+
+/* Release DQ (input Hi-Z). */
+static inline void ds18b20_dq_release(DS18B20_t *dev)
+{
+    GPIO_TypeDef *port = dev->dq.port;
+    uint32_t pos2 = (uint32_t)dev->dq_pin_index * 2U;
+
+    /* Input mode */
+    port->MODER &= ~(0x3U << pos2);
+
+    /* No pull-up/down */
+    port->PUPDR &= ~(0x3U << pos2);
+}
+
+/* Read DQ level (0/1). */
+static inline uint8_t ds18b20_dq_read(const DS18B20_t *dev)
+{
+    return ((dev->dq.port->IDR & dev->dq.pin) != 0U) ? 1U : 0U;
+}
+
+/* Dallas/Maxim CRC8 (poly 0x31 reflected => 0x8C). */
+static uint8_t ds18b20_crc8_maxim(const uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0U;
+
+    while (len-- != 0U)
+    {
+        uint8_t inbyte = *data++;
+        for (uint8_t i = 0U; i < 8U; i++)
+        {
+            uint8_t mix = (uint8_t)((crc ^ inbyte) & 0x01U);
+            crc >>= 1U;
+            if (mix != 0U)
+            {
+                crc ^= 0x8CU;
+            }
+            inbyte >>= 1U;
+        }
+    }
+
     return crc;
 }
 
-/* Start temperature conversion */
-static bool DS18B20_start_conversion(DS18B20_t *instance)
+/* 1-Wire reset + presence detect. */
+static uint8_t ds18b20_reset(DS18B20_t *dev)
 {
-    if (!DS18B20_reset(instance))
-    	return false;
+    uint8_t presence;
 
-    DS18B20_write_byte(instance, CMD_SKIP_ROM);
-    DS18B20_write_byte(instance, CMD_CONVERT_T);
+    DS18B20_CRITICAL_ENTER();
 
-    return true;
+    ds18b20_dq_drive_low(dev);
+    ds18b20_delay_us(dev, 500U);
+
+    ds18b20_dq_release(dev);
+    ds18b20_delay_us(dev, 70U);
+
+    presence = (ds18b20_dq_read(dev) == 0U) ? 1U : 0U;
+
+    ds18b20_delay_us(dev, 410U);
+
+    DS18B20_CRITICAL_EXIT();
+
+    return presence;
 }
 
-/* Read 9-byte scratchpad, return true if CRC OK */
-static bool DS18B20_read_scratchpad(DS18B20_t *instance, uint8_t sp[9])
+/* Write one bit (LSB-first). */
+static void ds18b20_write_bit(DS18B20_t *dev, uint8_t bit)
 {
-    if (!DS18B20_reset(instance))
-    	return false;
-    DS18B20_write_byte(instance, CMD_SKIP_ROM);
-    DS18B20_write_byte(instance, CMD_READ_SCR);
-    for (int i = 0; i < 9; i++)
-    	sp[i] = DS18B20_read_byte(instance);
+    DS18B20_CRITICAL_ENTER();
 
-    return (crc8_maxim(sp, 9) == 0);
-}
-
-int DS18B20_init(DS18B20_t *instance,
-                 TIM_HandleTypeDef *timer_handle,
-                 GPIO_TypeDef *data_port,
-                 uint16_t data_pin)
-{
-    if (!instance || !timer_handle || !data_port)
-    	return -1;
-
-    instance->port  = data_port;
-    instance->pin   = data_pin;
-    instance->timer = timer_handle;
-    instance->resolution = DS18B20_RESOLUTION_12_BIT;
-
-    /* Start the timer in free-run mode if not already running */
-    if (HAL_TIM_Base_GetState(timer_handle) == HAL_TIM_STATE_RESET)
+    if (bit != 0U)
     {
-        return -2; /* timer not inited via HAL_TIM_Base_Init */
+        /* Write '1': low 1..15 us, release till end of slot */
+        ds18b20_dq_drive_low(dev);
+        ds18b20_delay_us(dev, 6U);
+        ds18b20_dq_release(dev);
+        ds18b20_delay_us(dev, 64U);
     }
-    if (HAL_TIM_Base_Start(timer_handle) != HAL_OK)
+    else
     {
-        /* It is safe to call Start() even if already started; handle errors anyway */
-        return -3;
+        /* Write '0': low ~60 us */
+        ds18b20_dq_drive_low(dev);
+        ds18b20_delay_us(dev, 60U);
+        ds18b20_dq_release(dev);
+        ds18b20_delay_us(dev, 10U);
     }
 
-    /* Release the line (input) initially */
-    DS18B20_pin_release(instance);
-
-    /* Optional: presence check right away */
-    if (!DS18B20_reset(instance))
-        return -4;
-
-    return 0;
+    DS18B20_CRITICAL_EXIT();
 }
 
-int DS18B20_get_data(DS18B20_t *instance, float *temperature)
+/* Write one byte (LSB-first). */
+static void ds18b20_write_byte(DS18B20_t *dev, uint8_t data)
 {
-    if (!instance || !temperature)
-    	return -1;
-
-    if (instance->resolution < DS18B20_RESOLUTION_9_BIT || instance->resolution > DS18B20_RESOLUTION_12_BIT)
-    	return -2;
-
-    for (int attempt = 0; attempt < DS18B20_MAX_RETRIES; ++attempt)
+    for (uint8_t i = 0U; i < 8U; i++)
     {
-        /* Start conversion */
-        if (!DS18B20_start_conversion(instance))
+        ds18b20_write_bit(dev, (uint8_t)(data & 0x01U));
+        data >>= 1U;
+    }
+}
+
+/* Read one bit. */
+static uint8_t ds18b20_read_bit(DS18B20_t *dev)
+{
+    uint8_t bit;
+
+    DS18B20_CRITICAL_ENTER();
+
+    /* Read slot: low >= 1 us, release, sample around 15 us from start */
+    ds18b20_dq_drive_low(dev);
+    ds18b20_delay_us(dev, 2U);
+    ds18b20_dq_release(dev);
+
+    ds18b20_delay_us(dev, 13U);
+    bit = ds18b20_dq_read(dev);
+
+    ds18b20_delay_us(dev, 45U);
+
+    DS18B20_CRITICAL_EXIT();
+
+    return bit;
+}
+
+/* Read one byte (LSB-first). */
+static uint8_t ds18b20_read_byte(DS18B20_t *dev)
+{
+    uint8_t data = 0U;
+
+    for (uint8_t i = 0U; i < 8U; i++)
+    {
+        if (ds18b20_read_bit(dev) != 0U)
         {
-            /* If reset/presence failed, try next attempt */
+            data |= (uint8_t)(1U << i);
+        }
+    }
+
+    return data;
+}
+
+/* Start temperature conversion (SKIP ROM). */
+static uint8_t ds18b20_start_conversion(DS18B20_t *dev)
+{
+    if (ds18b20_reset(dev) == 0U)
+    {
+        return 0U;
+    }
+
+    ds18b20_write_byte(dev, DS18B20_CMD_SKIP_ROM);
+    ds18b20_write_byte(dev, DS18B20_CMD_CONVERT_T);
+
+    return 1U;
+}
+
+/* Read scratchpad (9 bytes) and verify CRC. */
+static uint8_t ds18b20_read_scratchpad(DS18B20_t *dev, uint8_t sp[9])
+{
+    if (ds18b20_reset(dev) == 0U)
+    {
+        return 0U;
+    }
+
+    ds18b20_write_byte(dev, DS18B20_CMD_SKIP_ROM);
+    ds18b20_write_byte(dev, DS18B20_CMD_READ_SCRATCHPAD);
+
+    for (uint8_t i = 0U; i < 9U; i++)
+    {
+        sp[i] = ds18b20_read_byte(dev);
+    }
+
+    return (ds18b20_crc8_maxim(sp, 8U) == sp[8]) ? 1U : 0U;
+}
+
+ds18b20_status_t ds18b20_init(DS18B20_t *dev, TIM_HandleTypeDef *htim, GPIO_t dq)
+{
+    HAL_StatusTypeDef st;
+
+    if (dev == NULL || htim == NULL || dq.port == NULL || ds18b20_is_single_pin(dq.pin) == 0U)
+    {
+        return DS18B20_ERR_PARAM;
+    }
+
+    dev->dq = dq;
+    dev->htim = htim;
+    dev->resolution = DS18B20_RESOLUTION_12_BIT;
+    dev->dq_pin_index = ds18b20_pin_to_index(dq.pin);
+
+    /* Timer must be initialized before use. */
+    if (HAL_TIM_Base_GetState(htim) == HAL_TIM_STATE_RESET)
+    {
+        return DS18B20_ERR_TIMER;
+    }
+
+    /* Start timer if needed. Treat HAL_BUSY as acceptable (already running). */
+    st = HAL_TIM_Base_Start(htim);
+    if (st != HAL_OK && st != HAL_BUSY)
+    {
+        return DS18B20_ERR_TIMER;
+    }
+
+    /* Release line initially (Hi-Z). */
+    ds18b20_dq_release(dev);
+
+    /* Optional presence check. */
+    if (ds18b20_reset(dev) == 0U)
+    {
+        return DS18B20_ERR_PRESENCE;
+    }
+
+    return DS18B20_OK;
+}
+
+ds18b20_status_t ds18b20_read_temperature(DS18B20_t *dev, float *temperature_c)
+{
+    if (dev == NULL || temperature_c == NULL)
+    {
+        return DS18B20_ERR_PARAM;
+    }
+
+    if (dev->resolution > DS18B20_RESOLUTION_12_BIT)
+    {
+        return DS18B20_ERR_PARAM;
+    }
+
+    for (uint32_t attempt = 0U; attempt < DS18B20_MAX_RETRIES; attempt++)
+    {
+        if (ds18b20_start_conversion(dev) == 0U)
+        {
             HAL_Delay(DS18B20_RETRY_DELAY_MS);
             continue;
         }
 
-        /* Max conversion time at 12-bit is 750 ms */
-        HAL_Delay(ds18b20_convertion_delay[instance->resolution]);
+        HAL_Delay((uint32_t)ds18b20_conversion_delay_ms[dev->resolution]);
 
-        /* Read scratchpad and check CRC */
         uint8_t sp[9];
-        if (DS18B20_read_scratchpad(instance, sp))
+        if (ds18b20_read_scratchpad(dev, sp) != 0U)
         {
-            /* sp[0]=LSB, sp[1]=MSB -> 1/16°C, two's complement */
-            int16_t raw = (int16_t)((sp[1] << 8) | sp[0]);
-            *temperature = (float)raw / 16.0f;
-            return 0; /* success */
+            int16_t raw = (int16_t)((uint16_t)sp[0] | ((uint16_t)sp[1] << 8U));
+            *temperature_c = (float)raw / 16.0f;
+            return DS18B20_OK;
         }
 
-        /* CRC failed: short settle time and retry whole sequence */
         HAL_Delay(DS18B20_RETRY_DELAY_MS);
     }
 
-    /* All attempts failed */
-    return -3; /* CRC / read failure */
+    return DS18B20_ERR_CRC;
 }
 
-int DS18B20_set_resolution(DS18B20_t *instance, DS18B20_RESOLUTION resolution)
+ds18b20_status_t ds18b20_set_resolution(DS18B20_t *dev, ds18b20_resolution_t resolution)
 {
-    if (!instance)
-    	return -1;
+    if (dev == NULL)
+    {
+        return DS18B20_ERR_PARAM;
+    }
 
-    if (resolution < DS18B20_RESOLUTION_9_BIT || resolution > DS18B20_RESOLUTION_12_BIT)
-    	return -2;
+    if (resolution > DS18B20_RESOLUTION_12_BIT)
+    {
+        return DS18B20_ERR_PARAM;
+    }
 
-    if (!DS18B20_reset(instance))
-    	return -3;
+    if (ds18b20_reset(dev) == 0U)
+    {
+        return DS18B20_ERR_PRESENCE;
+    }
 
-    DS18B20_write_byte(instance, CMD_SKIP_ROM);
-    DS18B20_write_byte(instance, CMD_WRITE_SCR);
+    ds18b20_write_byte(dev, DS18B20_CMD_SKIP_ROM);
+    ds18b20_write_byte(dev, DS18B20_CMD_WRITE_SCRATCHPAD);
 
-    /* Write TH and TL user bytes (leave defaults 0x4B, 0x46) */
-    DS18B20_write_byte(instance, 0x4B);  // TH
-    DS18B20_write_byte(instance, 0x46);  // TL
+    /* TH and TL bytes (defaults). */
+    ds18b20_write_byte(dev, 0x4BU);
+    ds18b20_write_byte(dev, 0x46U);
 
-    /* Config register: only R1:R0 (bits 6:5) matter */
-    uint8_t cfg = 0x1F; /* 00011111 */
-    cfg |= (resolution << 5);
-    DS18B20_write_byte(instance, cfg);
+    /* Config register: bits 6:5 select resolution. */
+    {
+        uint8_t cfg = 0x1FU;
+        cfg |= (uint8_t)((uint8_t)resolution << 5U);
+        ds18b20_write_byte(dev, cfg);
+    }
 
-    /* Copy scratchpad to EEPROM (t_WR up to 10 ms) */
-    if (!DS18B20_reset(instance))
-    	return -4;
+    /* Copy scratchpad to EEPROM (t_WR up to 10 ms). */
+    if (ds18b20_reset(dev) == 0U)
+    {
+        return DS18B20_ERR_PRESENCE;
+    }
 
-    DS18B20_write_byte(instance, CMD_SKIP_ROM);
-    DS18B20_write_byte(instance, CMD_COPY_SCR);
-    HAL_Delay(15);
+    ds18b20_write_byte(dev, DS18B20_CMD_SKIP_ROM);
+    ds18b20_write_byte(dev, DS18B20_CMD_COPY_SCRATCHPAD);
 
-    instance->resolution = resolution;
+    HAL_Delay(15U);
 
-    return 0;
+    dev->resolution = resolution;
+
+    return DS18B20_OK;
 }
-
