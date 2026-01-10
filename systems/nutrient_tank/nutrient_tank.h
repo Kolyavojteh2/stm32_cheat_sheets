@@ -36,13 +36,14 @@ typedef struct
     uint8_t valid;
     uint8_t fault;
 
+    /* 0 = do not check staleness */
     uint32_t stale_timeout_ms;
 } NutrientTank_Level_t;
 
 /* Hysteresis thresholds and policies for a tank */
 typedef struct
 {
-    /* Low/critical hysteresis for main tank */
+    /* Main tank thresholds */
     uint32_t main_low_ul;
     uint32_t main_resume_ul;
     uint32_t main_critical_ul;
@@ -52,17 +53,17 @@ typedef struct
     uint32_t return_request_ul;
     uint32_t return_resume_ul;
 
-    /* If main low/critical and return has enough volume -> request return */
+    /* Request return when main below this threshold */
     uint32_t main_request_return_ul;
 
-    /* If main too high -> block return to avoid overflow */
+    /* Block return/additions when main above this threshold */
     uint32_t main_block_return_ul;
 } NutrientTank_LevelPolicy_t;
 
 /* Stabilization timings after operations */
 typedef struct
 {
-    /* After any water/nutrient/pH dosing, run aeration and then settle */
+    /* After any dosing (water/nutrient/pH/return) run aeration and then settle */
     uint32_t after_dose_aerate_ms;
     uint32_t after_dose_settle_ms;
 
@@ -106,7 +107,7 @@ typedef enum
     NUTRIENT_TANK_EVENT_REQUEST_RETURN,
     NUTRIENT_TANK_EVENT_REQUEST_REFILL,
 
-    /* Control flow */
+    /* Control flow (reserved for closed-loop) */
     NUTRIENT_TANK_EVENT_CONTROL_DONE,
     NUTRIENT_TANK_EVENT_CONTROL_ERROR,
 
@@ -146,7 +147,7 @@ typedef enum
     NUTRIENT_TANK_CMD_CIRCULATION_SET,
     NUTRIENT_TANK_CMD_DOSE_VOLUME,
 
-    /* Closed-loop */
+    /* Closed-loop (not implemented in this step) */
     NUTRIENT_TANK_CMD_CONTROL_START,
     NUTRIENT_TANK_CMD_CONTROL_STOP,
 
@@ -182,7 +183,6 @@ typedef struct
 
         struct
         {
-            /* Enable closed-loop parts */
             uint8_t enable_ph;
             uint8_t enable_tds;
 
@@ -218,13 +218,13 @@ typedef struct
     NutrientTank_LevelPolicy_t level_policy;
     NutrientTank_Timing_t timing;
 
-    /* pH/TDS/temperature aggregator */
+    /* pH/TDS/temperature aggregator (not used in this step) */
     TankSensors_t *sensors;
 
-    /* Closed-loop logic */
+    /* Closed-loop logic (not executed in this step) */
     RecipeController_t *recipe;
 
-    /* Event queue size */
+    /* Event queue size is set by init() using event_buffer_len */
     uint8_t event_queue_size;
 } NutrientTank_Config_t;
 
@@ -244,6 +244,10 @@ typedef struct
 
     uint32_t state_started_at_ms;
     uint32_t wait_until_ms;
+
+    /* Rising-edge tracking to avoid event spam */
+    uint8_t request_return_active;
+    uint8_t request_refill_active;
 
     /* Simple ring-buffer for events */
     uint8_t ev_wr;

@@ -9,7 +9,6 @@ extern "C" {
 
 #define RECIPE_NUTRIENT_MAX_PUMPS    4U
 
-/* What kind of step controller requests */
 typedef enum
 {
     RECIPE_STEP_NONE = 0,
@@ -18,7 +17,6 @@ typedef enum
     RECIPE_STEP_ERROR
 } RecipeStepType_t;
 
-/* Dosing target */
 typedef enum
 {
     RECIPE_DOSE_NONE = 0,
@@ -42,46 +40,56 @@ typedef struct
 
 typedef struct
 {
-    uint8_t enable_ph;
-    uint8_t enable_tds;
-
-    /* pH in x1000 (e.g. 6.250 -> 6250) */
-    int32_t target_ph_x1000;
-    int32_t ph_tolerance_x1000;
-
-    /* TDS in ppm */
-    int32_t target_tds_ppm;
-    int32_t tds_tolerance_ppm;
-
-    /* Safety limits */
+    /* Step size defaults, limits and nutrient pool definition */
     uint32_t max_total_dose_ul;
     uint32_t max_single_dose_ul;
 
-    /* Step sizes (closed-loop increments) */
+    /* pH dosing step (uL) */
     uint32_t ph_step_ul;
 
-    /* TDS control: prefer nutrients, can dilute with water */
+    /* TDS control steps (uL) */
     uint32_t tds_nutrient_step_ul;
     uint32_t tds_water_step_ul;
 
     /* Nutrient pump count (1..4) */
     uint8_t nutrient_count;
 
-    /* Optional: per-nutrient enable mask */
+    /* If mask bit i = 1 -> nutrient i is enabled.
+       If mask == 0 -> all nutrients [0..count-1] enabled. */
     uint8_t nutrient_enable_mask;
 } RecipeController_Config_t;
 
 typedef struct
 {
+    /* Dynamic targets (set by NutrientTank control command) */
+    uint8_t enable_ph;
+    uint8_t enable_tds;
+
+    int32_t target_ph_x1000;
+    int32_t ph_tolerance_x1000;
+
+    int32_t target_tds_ppm;
+    int32_t tds_tolerance_ppm;
+} RecipeController_Targets_t;
+
+typedef struct
+{
     RecipeController_Config_t cfg;
+    RecipeController_Targets_t targets;
 
     uint32_t total_dosed_ul;
+
     uint8_t active;
     uint8_t error;
+
+    uint8_t last_nutrient_index;
 } RecipeController_t;
 
 /* Init controller instance */
 uint8_t recipe_controller_init(RecipeController_t *rc, const RecipeController_Config_t *cfg);
+
+/* Update dynamic targets */
+uint8_t recipe_controller_set_targets(RecipeController_t *rc, const RecipeController_Targets_t *targets);
 
 /* Start/stop closed-loop */
 void recipe_controller_start(RecipeController_t *rc);

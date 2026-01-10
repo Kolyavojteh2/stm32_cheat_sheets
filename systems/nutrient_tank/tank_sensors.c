@@ -1,6 +1,27 @@
 #include "tank_sensors.h"
 #include <string.h>
 
+/* Wrap-safe time compare (valid if deadlines within +/- 2^31 ms). */
+static uint8_t ts_is_fresh_value(const TankSensorValue_t *v, uint32_t now_ms, uint32_t stale_timeout_ms)
+{
+    uint32_t age_ms;
+
+    if (v == NULL) {
+        return 0U;
+    }
+
+    if (v->valid == 0U) {
+        return 0U;
+    }
+
+    if (stale_timeout_ms == 0U) {
+        return 1U;
+    }
+
+    age_ms = (uint32_t)(now_ms - v->updated_at_ms);
+    return (age_ms <= stale_timeout_ms) ? 1U : 0U;
+}
+
 uint8_t tank_sensors_init(TankSensors_t *s, uint32_t stale_timeout_ms)
 {
     if (s == NULL) {
@@ -46,14 +67,52 @@ void tank_sensors_update_tds_ppm(TankSensors_t *s, uint32_t now_ms, int32_t tds_
     s->tds_ppm.value = tds_ppm;
 }
 
-uint8_t tank_sensors_is_fresh(const TankSensors_t *s, uint32_t now_ms)
+uint8_t tank_sensors_is_temperature_fresh(const TankSensors_t *s, uint32_t now_ms)
 {
-    (void)now_ms;
-
     if (s == NULL) {
         return 0U;
     }
 
-    /* Skeleton: do not enforce freshness yet */
+    return ts_is_fresh_value(&s->temperature_mC, now_ms, s->stale_timeout_ms);
+}
+
+uint8_t tank_sensors_is_ph_fresh(const TankSensors_t *s, uint32_t now_ms)
+{
+    if (s == NULL) {
+        return 0U;
+    }
+
+    return ts_is_fresh_value(&s->ph_x1000, now_ms, s->stale_timeout_ms);
+}
+
+uint8_t tank_sensors_is_tds_fresh(const TankSensors_t *s, uint32_t now_ms)
+{
+    if (s == NULL) {
+        return 0U;
+    }
+
+    return ts_is_fresh_value(&s->tds_ppm, now_ms, s->stale_timeout_ms);
+}
+
+uint8_t tank_sensors_are_fresh(const TankSensors_t *s,
+                               uint32_t now_ms,
+                               uint8_t need_temperature,
+                               uint8_t need_ph,
+                               uint8_t need_tds)
+{
+    if (s == NULL) {
+        return 0U;
+    }
+
+    if (need_temperature != 0U && tank_sensors_is_temperature_fresh(s, now_ms) == 0U) {
+        return 0U;
+    }
+    if (need_ph != 0U && tank_sensors_is_ph_fresh(s, now_ms) == 0U) {
+        return 0U;
+    }
+    if (need_tds != 0U && tank_sensors_is_tds_fresh(s, now_ms) == 0U) {
+        return 0U;
+    }
+
     return 1U;
 }
