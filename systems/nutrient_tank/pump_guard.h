@@ -17,7 +17,8 @@ typedef enum
     PUMP_GUARD_BLOCK_STALE_LEVEL
 } PumpGuard_BlockReason_t;
 
-/* Level mapping callback: distance (mm) -> volume (uL) */
+/* Level mapping callback: distance (mm) -> volume (uL)
+   Return 0 if mapping cannot be done (treated as low volume unless min_volume_ul==0). */
 typedef uint32_t (*PumpGuard_VolumeMapFn)(void *ctx, uint32_t distance_mm);
 
 typedef struct
@@ -29,18 +30,19 @@ typedef struct
     PumpGuard_VolumeMapFn map_fn;
     void *map_ctx;
 
+    /* Minimum allowed volume in source container */
     uint32_t min_volume_ul;
 
     /* If sensor exists and fault/no-data: block pump */
     uint8_t block_on_sensor_fault;
 
-    /* If sensor exists: how long level can be considered valid */
+    /* If sensor exists: how long level can be considered valid.
+       0 = do not check staleness */
     uint32_t level_stale_timeout_ms;
 } PumpGuard_Config_t;
 
 typedef struct
 {
-    uint8_t has_level;
     uint8_t sensor_fault;
 
     uint32_t last_distance_mm;
@@ -73,15 +75,26 @@ uint8_t pump_guard_can_run(PumpGuard_t *guard, uint32_t now_ms);
 
 /* Start/stop via guard (will check blocking) */
 uint8_t pump_guard_start_for_ms(PumpGuard_t *guard, uint32_t now_ms, uint32_t run_time_ms);
+uint8_t pump_guard_start_for_volume_ul(PumpGuard_t *guard,
+                                       uint32_t now_ms,
+                                       uint32_t volume_ul,
+                                       uint32_t *actual_run_time_ms);
+
 uint8_t pump_guard_stop(PumpGuard_t *guard);
 
-/* Process periodic checks */
+/* Process periodic checks.
+   If pump is running and becomes blocked -> stops it. */
 void pump_guard_process(PumpGuard_t *guard, uint32_t now_ms);
 
-/* Inline helper */
+/* Inline helpers */
 static inline PumpGuard_BlockReason_t pump_guard_get_block_reason(const PumpGuard_t *guard)
 {
     return (guard != NULL) ? guard->state.block_reason : PUMP_GUARD_BLOCK_SENSOR_FAULT;
+}
+
+static inline uint32_t pump_guard_get_last_volume_ul(const PumpGuard_t *guard)
+{
+    return (guard != NULL) ? guard->state.last_volume_ul : 0U;
 }
 
 #ifdef __cplusplus
