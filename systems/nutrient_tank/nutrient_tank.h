@@ -249,6 +249,8 @@ typedef struct
     uint8_t request_return_active;
     uint8_t request_refill_active;
 
+    uint8_t control_active;
+
     /* Simple ring-buffer for events */
     uint8_t ev_wr;
     uint8_t ev_rd;
@@ -290,7 +292,11 @@ uint8_t nutrient_tank_pop_event(NutrientTank_t *tank, NutrientTank_Event_t *ev_o
 /* Stop everything immediately */
 void nutrient_tank_emergency_stop(NutrientTank_t *tank);
 
-/* Inline getters */
+static inline uint8_t nutrient_tank_is_control_active(const NutrientTank_t *tank)
+{
+    return (tank != NULL && tank->st.control_active != 0U) ? 1U : 0U;
+}
+
 static inline NutrientTank_State_t nutrient_tank_get_state(const NutrientTank_t *tank)
 {
     return (tank != NULL) ? tank->st.state : NUTRIENT_TANK_STATE_ERROR;

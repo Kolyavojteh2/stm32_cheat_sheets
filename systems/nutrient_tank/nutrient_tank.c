@@ -79,6 +79,29 @@ static void nt_stop_all_pumps(NutrientTank_t *tank)
     nt_stop_guard(tank->cfg.return_pump);
 }
 
+static void nt_stop_operation_pumps(NutrientTank_t *tank)
+{
+    uint8_t i;
+
+    if (tank == NULL) {
+        return;
+    }
+
+    nt_stop_guard(tank->cfg.water_in);
+
+    for (i = 0U; i < tank->cfg.nutrient_count && i < NUTRIENT_TANK_NUTRIENT_MAX_PUMPS; i++) {
+        nt_stop_guard(tank->cfg.nutrients[i]);
+    }
+
+    nt_stop_guard(tank->cfg.ph_up);
+    nt_stop_guard(tank->cfg.ph_down);
+
+    nt_stop_guard(tank->cfg.air);
+
+    nt_stop_guard(tank->cfg.drain);
+    nt_stop_guard(tank->cfg.return_pump);
+}
+
 static void nt_process_all_guards(NutrientTank_t *tank, uint32_t now_ms)
 {
     uint8_t i;
@@ -302,11 +325,7 @@ static uint8_t nt_main_allows_return(const NutrientTank_t *tank, uint32_t now_ms
 
 static PumpGuard_t *nt_get_guard_for_dose(NutrientTank_t *tank, const NutrientTank_Command_t *cmd)
 {
-    if (tank == NULL || cmd == NULL) {
-        return NULL;
-    }
-
-    if (cmd->type != NUTRIENT_TANK_CMD_DOSE_VOLUME) {
+    if (tank == NULL || cmd == NULL || cmd->type != NUTRIENT_TANK_CMD_DOSE_VOLUME) {
         return NULL;
     }
 
@@ -425,6 +444,7 @@ static void nt_update_level_states_and_events(NutrientTank_t *tank, uint32_t now
     req_refill = 0U;
 
     if (tank->cfg.main_level.map_fn != NULL) {
+
         if (tank->st.main_level_state == NUTRIENT_TANK_LEVEL_LOW ||
             tank->st.main_level_state == NUTRIENT_TANK_LEVEL_CRITICAL) {
             req_return = 1U;
@@ -496,6 +516,51 @@ static void nt_apply_circulation_policy(NutrientTank_t *tank, uint32_t now_ms)
     }
 }
 
+static uint8_t nt_try_start_dose_with_policy(NutrientTank_t *tank, uint32_t now_ms, const NutrientTank_Command_t *cmd)
+{
+    PumpGuard_t *guard;
+
+    if (tank == NULL || cmd == NULL || cmd->type != NUTRIENT_TANK_CMD_DOSE_VOLUME) {
+        return 0U;
+    }
+
+    guard = nt_get_guard_for_dose(tank, cmd);
+    if (guard == NULL) {
+        tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
+        return 0U;
+    }
+
+    if (cmd->p.dose.kind == NUTRIENT_TANK_DOSE_DRAIN) {
+        if (nt_main_allows_drain(tank, now_ms) == 0U) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_SENSOR_FAULT;
+            return 0U;
+        }
+    } else if (cmd->p.dose.kind == NUTRIENT_TANK_DOSE_RETURN) {
+        if (nt_main_allows_return(tank, now_ms) == 0U) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_SENSOR_FAULT;
+            return 0U;
+        }
+    } else {
+        if (nt_main_allows_addition(tank, now_ms) == 0U) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_SENSOR_FAULT;
+            return 0U;
+        }
+    }
+
+    if (pump_guard_start_for_volume_ul(guard, now_ms, cmd->p.dose.volume_ul, NULL) == 0U) {
+        tank->st.last_error = NUTRIENT_TANK_ERR_PUMP_BLOCKED;
+        nt_push_event(tank,
+                      NUTRIENT_TANK_EVENT_OPERATION_BLOCKED,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      tank->st.last_error,
+                      pump_guard_get_block_reason(guard));
+        return 0U;
+    }
+
+    return 1U;
+}
+
 static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
 {
     PumpGuard_t *guard;
@@ -542,61 +607,7 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
 
         if (tank->st.active_cmd.type == NUTRIENT_TANK_CMD_DOSE_VOLUME) {
 
-            guard = nt_get_guard_for_dose(tank, &tank->st.active_cmd);
-            if (guard == NULL) {
-                tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
-                tank->st.has_active_cmd = 0U;
-                return;
-            }
-
-            /* Tank-level policies (in addition to pump guard). */
-            if (tank->st.active_cmd.p.dose.kind == NUTRIENT_TANK_DOSE_DRAIN) {
-                if (nt_main_allows_drain(tank, now_ms) == 0U) {
-                    tank->st.last_error = (tank->cfg.main_level.map_fn != NULL) ? NUTRIENT_TANK_ERR_SENSOR_FAULT : NUTRIENT_TANK_ERR_PUMP_BLOCKED;
-                    nt_push_event(tank,
-                                  NUTRIENT_TANK_EVENT_OPERATION_BLOCKED,
-                                  tank->cfg.main_level.last_volume_ul,
-                                  tank->cfg.return_level.last_volume_ul,
-                                  tank->st.last_error,
-                                  PUMP_GUARD_BLOCK_NONE);
-                    tank->st.has_active_cmd = 0U;
-                    return;
-                }
-            } else if (tank->st.active_cmd.p.dose.kind == NUTRIENT_TANK_DOSE_RETURN) {
-                if (nt_main_allows_return(tank, now_ms) == 0U) {
-                    tank->st.last_error = (tank->cfg.main_level.map_fn != NULL) ? NUTRIENT_TANK_ERR_SENSOR_FAULT : NUTRIENT_TANK_ERR_PUMP_BLOCKED;
-                    nt_push_event(tank,
-                                  NUTRIENT_TANK_EVENT_OPERATION_BLOCKED,
-                                  tank->cfg.main_level.last_volume_ul,
-                                  tank->cfg.return_level.last_volume_ul,
-                                  tank->st.last_error,
-                                  PUMP_GUARD_BLOCK_NONE);
-                    tank->st.has_active_cmd = 0U;
-                    return;
-                }
-            } else {
-                /* Additions into main tank (water/nutrient/pH) */
-                if (nt_main_allows_addition(tank, now_ms) == 0U) {
-                    tank->st.last_error = (tank->cfg.main_level.map_fn != NULL) ? NUTRIENT_TANK_ERR_SENSOR_FAULT : NUTRIENT_TANK_ERR_PUMP_BLOCKED;
-                    nt_push_event(tank,
-                                  NUTRIENT_TANK_EVENT_OPERATION_BLOCKED,
-                                  tank->cfg.main_level.last_volume_ul,
-                                  tank->cfg.return_level.last_volume_ul,
-                                  tank->st.last_error,
-                                  PUMP_GUARD_BLOCK_NONE);
-                    tank->st.has_active_cmd = 0U;
-                    return;
-                }
-            }
-
-            if (pump_guard_start_for_volume_ul(guard, now_ms, tank->st.active_cmd.p.dose.volume_ul, NULL) == 0U) {
-                tank->st.last_error = NUTRIENT_TANK_ERR_PUMP_BLOCKED;
-                nt_push_event(tank,
-                              NUTRIENT_TANK_EVENT_OPERATION_BLOCKED,
-                              tank->cfg.main_level.last_volume_ul,
-                              tank->cfg.return_level.last_volume_ul,
-                              tank->st.last_error,
-                              pump_guard_get_block_reason(guard));
+            if (nt_try_start_dose_with_policy(tank, now_ms, &tank->st.active_cmd) == 0U) {
                 tank->st.has_active_cmd = 0U;
                 return;
             }
@@ -606,22 +617,6 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
             return;
         }
 
-        /* Closed-loop commands are not executed in this step */
-        if (tank->st.active_cmd.type == NUTRIENT_TANK_CMD_CONTROL_START ||
-            tank->st.active_cmd.type == NUTRIENT_TANK_CMD_CONTROL_STOP) {
-
-            tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
-            nt_push_event(tank,
-                          NUTRIENT_TANK_EVENT_CONTROL_ERROR,
-                          tank->cfg.main_level.last_volume_ul,
-                          tank->cfg.return_level.last_volume_ul,
-                          tank->st.last_error,
-                          PUMP_GUARD_BLOCK_NONE);
-            tank->st.has_active_cmd = 0U;
-            return;
-        }
-
-        /* Unknown command */
         tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
         tank->st.has_active_cmd = 0U;
         return;
@@ -747,6 +742,140 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
     }
 }
 
+static uint8_t nt_control_sensors_fresh(const NutrientTank_t *tank, uint32_t now_ms)
+{
+    uint8_t need_ph = 0U;
+    uint8_t need_tds = 0U;
+
+    if (tank == NULL || tank->cfg.recipe == NULL) {
+        return 0U;
+    }
+
+    if (tank->cfg.sensors == NULL) {
+        return 0U;
+    }
+
+    need_ph = tank->cfg.recipe->targets.enable_ph;
+    need_tds = tank->cfg.recipe->targets.enable_tds;
+
+    return tank_sensors_are_fresh(tank->cfg.sensors, now_ms, 0U, need_ph, need_tds);
+}
+
+static void nt_control_process(NutrientTank_t *tank, uint32_t now_ms)
+{
+    RecipeStep_t step;
+    NutrientTank_Command_t cmd;
+
+    if (tank == NULL) {
+        return;
+    }
+
+    if (tank->st.control_active == 0U) {
+        return;
+    }
+
+    if (tank->cfg.recipe == NULL || tank->cfg.sensors == NULL) {
+        tank->st.control_active = 0U;
+        tank->st.last_error = NUTRIENT_TANK_ERR_SENSOR_FAULT;
+        nt_push_event(tank, NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      tank->st.last_error,
+                      PUMP_GUARD_BLOCK_NONE);
+        return;
+    }
+
+    /* Wait until tank is ready to start a new operation */
+    if (tank->st.state != NUTRIENT_TANK_STATE_IDLE || tank->st.has_active_cmd != 0U) {
+        return;
+    }
+
+    step = recipe_controller_next_step(tank->cfg.recipe,
+                                       tank->cfg.sensors->ph_x1000.value,
+                                       tank->cfg.sensors->tds_ppm.value,
+                                       nt_control_sensors_fresh(tank, now_ms));
+
+    if (step.type == RECIPE_STEP_NONE) {
+        return;
+    }
+
+    if (step.type == RECIPE_STEP_DONE) {
+        recipe_controller_stop(tank->cfg.recipe);
+        tank->st.control_active = 0U;
+        tank->st.last_error = NUTRIENT_TANK_ERR_NONE;
+
+        nt_push_event(tank, NUTRIENT_TANK_EVENT_CONTROL_DONE,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      NUTRIENT_TANK_ERR_NONE,
+                      PUMP_GUARD_BLOCK_NONE);
+        return;
+    }
+
+    if (step.type == RECIPE_STEP_ERROR) {
+        recipe_controller_stop(tank->cfg.recipe);
+        tank->st.control_active = 0U;
+        tank->st.last_error = NUTRIENT_TANK_ERR_TIMEOUT;
+
+        nt_push_event(tank, NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      tank->st.last_error,
+                      PUMP_GUARD_BLOCK_NONE);
+        return;
+    }
+
+    /* Convert step -> internal dose command */
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = NUTRIENT_TANK_CMD_DOSE_VOLUME;
+
+    if (step.dose_kind == RECIPE_DOSE_WATER) {
+        cmd.p.dose.kind = NUTRIENT_TANK_DOSE_WATER;
+    } else if (step.dose_kind == RECIPE_DOSE_NUTRIENT) {
+        cmd.p.dose.kind = NUTRIENT_TANK_DOSE_NUTRIENT;
+        cmd.p.dose.nutrient_index = step.nutrient_index;
+    } else if (step.dose_kind == RECIPE_DOSE_PH_UP) {
+        cmd.p.dose.kind = NUTRIENT_TANK_DOSE_PH_UP;
+    } else if (step.dose_kind == RECIPE_DOSE_PH_DOWN) {
+        cmd.p.dose.kind = NUTRIENT_TANK_DOSE_PH_DOWN;
+    } else {
+        recipe_controller_stop(tank->cfg.recipe);
+        tank->st.control_active = 0U;
+        tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
+
+        nt_push_event(tank, NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      tank->st.last_error,
+                      PUMP_GUARD_BLOCK_NONE);
+        return;
+    }
+
+    cmd.p.dose.volume_ul = step.dose_volume_ul;
+
+    /* Push as active command (no queue) */
+    tank->st.active_cmd = cmd;
+    tank->st.has_active_cmd = 1U;
+
+    /* If the upcoming operation is blocked by policy, stop control early. */
+    if (tank->st.active_cmd.p.dose.kind == NUTRIENT_TANK_DOSE_DRAIN &&
+        nt_main_allows_drain(tank, now_ms) == 0U) {
+
+        recipe_controller_stop(tank->cfg.recipe);
+        tank->st.control_active = 0U;
+        tank->st.last_error = NUTRIENT_TANK_ERR_SENSOR_FAULT;
+
+        nt_push_event(tank, NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                      tank->cfg.main_level.last_volume_ul,
+                      tank->cfg.return_level.last_volume_ul,
+                      tank->st.last_error,
+                      PUMP_GUARD_BLOCK_NONE);
+
+        tank->st.has_active_cmd = 0U;
+        return;
+    }
+}
+
 uint8_t nutrient_tank_init(NutrientTank_t *tank,
                            const NutrientTank_Config_t *cfg,
                            NutrientTank_Event_t *event_buffer,
@@ -768,6 +897,8 @@ uint8_t nutrient_tank_init(NutrientTank_t *tank,
 
     tank->st.main_level_state = NUTRIENT_TANK_LEVEL_OK;
     tank->st.return_level_state = NUTRIENT_TANK_LEVEL_OK;
+
+    tank->st.control_active = 0U;
 
     tank->st.ev_wr = 0U;
     tank->st.ev_rd = 0U;
@@ -800,6 +931,11 @@ void nutrient_tank_reset(NutrientTank_t *tank)
     tank->st.request_return_active = 0U;
     tank->st.request_refill_active = 0U;
 
+    if (tank->cfg.recipe != NULL) {
+        recipe_controller_stop(tank->cfg.recipe);
+    }
+    tank->st.control_active = 0U;
+
     tank->st.ev_wr = 0U;
     tank->st.ev_rd = 0U;
 }
@@ -826,10 +962,15 @@ void nutrient_tank_process(NutrientTank_t *tank, uint32_t now_ms)
 
     /* Execute active manual command state machine. */
     nt_handle_active_command(tank, now_ms);
+
+    /* Closed-loop runs only when idle and no active command */
+    nt_control_process(tank, now_ms);
 }
 
 uint8_t nutrient_tank_submit_command(NutrientTank_t *tank, const NutrientTank_Command_t *cmd)
 {
+    RecipeController_Targets_t targets;
+
     if (tank == NULL || cmd == NULL) {
         return 0U;
     }
@@ -850,6 +991,65 @@ uint8_t nutrient_tank_submit_command(NutrientTank_t *tank, const NutrientTank_Co
         return 1U;
     }
 
+    if (cmd->type == NUTRIENT_TANK_CMD_CONTROL_STOP) {
+
+        if (tank->cfg.recipe != NULL) {
+            recipe_controller_stop(tank->cfg.recipe);
+        }
+        tank->st.control_active = 0U;
+
+        /* Cancel current operation but keep circulation state */
+        tank->st.has_active_cmd = 0U;
+        tank->st.state = NUTRIENT_TANK_STATE_IDLE;
+        nt_stop_operation_pumps(tank);
+
+        return 1U;
+    }
+
+    if (cmd->type == NUTRIENT_TANK_CMD_CONTROL_START) {
+
+        if (tank->cfg.recipe == NULL) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
+            return 0U;
+        }
+
+        if (tank->st.control_active != 0U) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_BUSY;
+            return 0U;
+        }
+
+        if (tank->st.has_active_cmd != 0U || tank->st.state != NUTRIENT_TANK_STATE_IDLE) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_BUSY;
+            return 0U;
+        }
+
+        memset(&targets, 0, sizeof(targets));
+        targets.enable_ph = cmd->p.control.enable_ph;
+        targets.enable_tds = cmd->p.control.enable_tds;
+
+        targets.target_ph_x1000 = cmd->p.control.target_ph_x1000;
+        targets.ph_tolerance_x1000 = cmd->p.control.ph_tolerance_x1000;
+
+        targets.target_tds_ppm = cmd->p.control.target_tds_ppm;
+        targets.tds_tolerance_ppm = cmd->p.control.tds_tolerance_ppm;
+
+        if (recipe_controller_set_targets(tank->cfg.recipe, &targets) == 0U) {
+            tank->st.last_error = NUTRIENT_TANK_ERR_INVALID_ARG;
+            return 0U;
+        }
+
+        recipe_controller_start(tank->cfg.recipe);
+        tank->st.control_active = 1U;
+
+        return 1U;
+    }
+
+    /* While control is active, block manual operations (except circulation/emergency/control_stop) */
+    if (tank->st.control_active != 0U) {
+        tank->st.last_error = NUTRIENT_TANK_ERR_BUSY;
+        return 0U;
+    }
+
     /* Single active command policy (no queue). */
     if (tank->st.has_active_cmd != 0U ||
         (tank->st.state != NUTRIENT_TANK_STATE_IDLE && tank->st.state != NUTRIENT_TANK_STATE_WAIT_SETTLE)) {
@@ -867,11 +1067,7 @@ void nutrient_tank_update_main_distance_mm(NutrientTank_t *tank, uint32_t now_ms
 {
     uint32_t volume_ul;
 
-    if (tank == NULL) {
-        return;
-    }
-
-    if (tank->cfg.main_level.map_fn == NULL) {
+    if (tank == NULL || tank->cfg.main_level.map_fn == NULL) {
         return;
     }
 
@@ -889,11 +1085,7 @@ void nutrient_tank_set_main_sensor_fault(NutrientTank_t *tank, uint32_t now_ms)
 {
     (void)now_ms;
 
-    if (tank == NULL) {
-        return;
-    }
-
-    if (tank->cfg.main_level.map_fn == NULL) {
+    if (tank == NULL || tank->cfg.main_level.map_fn == NULL) {
         return;
     }
 
@@ -905,11 +1097,7 @@ void nutrient_tank_update_return_distance_mm(NutrientTank_t *tank, uint32_t now_
 {
     uint32_t volume_ul;
 
-    if (tank == NULL) {
-        return;
-    }
-
-    if (tank->cfg.return_level.map_fn == NULL) {
+    if (tank == NULL || tank->cfg.return_level.map_fn == NULL) {
         return;
     }
 
@@ -927,11 +1115,7 @@ void nutrient_tank_set_return_sensor_fault(NutrientTank_t *tank, uint32_t now_ms
 {
     (void)now_ms;
 
-    if (tank == NULL) {
-        return;
-    }
-
-    if (tank->cfg.return_level.map_fn == NULL) {
+    if (tank == NULL || tank->cfg.return_level.map_fn == NULL) {
         return;
     }
 
@@ -969,6 +1153,11 @@ void nutrient_tank_emergency_stop(NutrientTank_t *tank)
 
     tank->st.circulation_requested = 0U;
     tank->st.has_active_cmd = 0U;
+
+    if (tank->cfg.recipe != NULL) {
+        recipe_controller_stop(tank->cfg.recipe);
+    }
+    tank->st.control_active = 0U;
 
     tank->st.state = NUTRIENT_TANK_STATE_STOPPED;
     tank->st.last_error = NUTRIENT_TANK_ERR_NONE;
