@@ -793,7 +793,8 @@ static void nt_control_process(NutrientTank_t *tank, uint32_t now_ms)
     step = recipe_controller_next_step(tank->cfg.recipe,
                                        tank->cfg.sensors->ph_x1000.value,
                                        tank->cfg.sensors->tds_ppm.value,
-                                       nt_control_sensors_fresh(tank, now_ms));
+                                       nt_control_sensors_fresh(tank, now_ms),
+                                       tank->cfg.main_level.last_volume_ul);
 
     if (step.type == RECIPE_STEP_NONE) {
         return;
