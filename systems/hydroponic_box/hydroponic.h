@@ -28,7 +28,7 @@ typedef enum {
 
 typedef struct {
     DS3231_t *rtc;
-    DHT22_t *dht22;                 /* UPDATED */
+    DHT22_t *dht22;
     AT24C04_t *eeprom;
 
     uint16_t rtc_int_pin;
@@ -60,7 +60,33 @@ typedef struct {
 
     uint8_t error_flags;
     uint8_t light_is_on;
+
     uint16_t boot_count;
+
+    /*
+    Power outage compensation state (RAM cache).
+
+    deficit_minutes:
+        Total missing light minutes accumulated across multiple outages.
+
+    outage_count:
+        Number of detected outages (or long resets) based on last_alive gap.
+        This is stored in EEPROM and incremented on boot when gap > threshold.
+
+    last_process_min_2000:
+        Used to decrement deficit minutes robustly if minute ticks were missed.
+
+    heartbeat_slot:
+        Used to write EEPROM once per 5 minutes (slot = now_min / 5).
+
+    compensation_active:
+        Indicates we were doing night compensation in the previous interval.
+    */
+    uint32_t deficit_minutes;
+    uint32_t outage_count;
+    uint32_t last_process_min_2000;
+    uint32_t heartbeat_slot;
+    uint8_t compensation_active;
 } Hydroponic_t;
 
 int hydroponic_init(Hydroponic_t *self, const HydroponicConfig_t *cfg);

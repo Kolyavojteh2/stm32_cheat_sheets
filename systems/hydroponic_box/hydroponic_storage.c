@@ -1,7 +1,7 @@
 #include "hydroponic_storage.h"
 
 #define HYDROPONIC_STORAGE_MAGIC      (0x48594450u) /* 'H''Y''D''P' */
-#define HYDROPONIC_STORAGE_VERSION    (1u)
+#define HYDROPONIC_STORAGE_VERSION    (3u)          /* Bumped due to new field outage_count */
 
 static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
 {
@@ -68,6 +68,7 @@ int hydroponic_storage_save(HydroponicStorage_t *self, const HydroponicStorageRe
     }
 
     HydroponicStorageRecord_t tmp = *rec;
+
     tmp.magic = HYDROPONIC_STORAGE_MAGIC;
     tmp.version = HYDROPONIC_STORAGE_VERSION;
 
