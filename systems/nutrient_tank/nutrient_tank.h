@@ -250,6 +250,7 @@ typedef struct
     uint8_t request_refill_active;
 
     uint8_t control_active;
+    uint8_t control_generated_cmd;
 
     /* Simple ring-buffer for events */
     uint8_t ev_wr;

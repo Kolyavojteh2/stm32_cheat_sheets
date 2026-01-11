@@ -47,11 +47,11 @@ typedef struct
     /* pH dosing step (uL) */
     uint32_t ph_step_ul;
 
-    /* Legacy absolute steps (uL) */
+    /* Legacy absolute steps (uL) as fallback when volume is unknown */
     uint32_t tds_nutrient_step_ul;
     uint32_t tds_water_step_ul;
 
-    /* Per-liter steps (uL per liter). If non-zero, used with main_volume_ul. */
+    /* Per-liter full-step (uL per liter) when portion_x1000 = 1000 */
     uint32_t tds_nutrient_step_ul_per_l;
     uint32_t tds_water_step_ul_per_l;
 
@@ -62,18 +62,26 @@ typedef struct
        If mask == 0 -> all nutrients [0..count-1] enabled. */
     uint8_t nutrient_enable_mask;
 
-    /* Explicit ratio weights (if sum > 0 they are used) */
+    /* Mix weights:
+       If sum(nutrient_ratio) > 0 -> use nutrient_ratio
+       else if sum(nutrient_parts_per_l) > 0 -> use nutrient_parts_per_l
+       else -> equal weights */
     uint16_t nutrient_ratio[RECIPE_NUTRIENT_MAX_PUMPS];
-
-    /* Alternative way: "parts per liter" (used as weights if nutrient_ratio sum == 0) */
     uint16_t nutrient_parts_per_l[RECIPE_NUTRIENT_MAX_PUMPS];
 
-    /* One "part" volume (uL). If set, controller can derive tds_nutrient_step_ul_per_l:
-       step_ul_per_l = part_volume_ul * sum(parts_per_l) * step_portion_x1000 / 1000 */
+    /* If provided, controller can derive "full dose per liter" from parts:
+       full_per_l_ul = nutrient_part_volume_ul * sum(parts_per_l) */
     uint32_t nutrient_part_volume_ul;
 
-    /* Portion scaling for nutrient per-liter step (x1000). Example: 100 = 0.1 portion. */
-    uint16_t tds_nutrient_step_portion_x1000;
+    /* Adaptive portion settings for nutrient dosing (x1000) */
+    uint16_t tds_nutrient_err_full_ppm;
+    uint16_t tds_nutrient_portion_min_x1000;
+    uint16_t tds_nutrient_portion_max_x1000;
+
+    /* Adaptive portion settings for water dilution (x1000) */
+    uint16_t tds_water_err_full_ppm;
+    uint16_t tds_water_portion_min_x1000;
+    uint16_t tds_water_portion_max_x1000;
 } RecipeController_Config_t;
 
 typedef struct
@@ -94,15 +102,23 @@ typedef struct
     RecipeController_Config_t cfg;
     RecipeController_Targets_t targets;
 
+    /* Total committed dose (only increases after successful execution) */
     uint32_t total_dosed_ul;
 
     uint8_t active;
     uint8_t error;
 
-    /* Pending nutrient-mix plan (one TDS correction step split across channels) */
+    /* Pending nutrient-mix plan (split of ONE TDS correction step) */
     uint8_t mix_active;
     uint8_t mix_next_index;
     uint32_t mix_remaining_ul[RECIPE_NUTRIENT_MAX_PUMPS];
+
+    /* Inflight step (must be acknowledged by nutrient_tank) */
+    uint8_t inflight_active;
+    uint8_t inflight_is_mix;
+    RecipeDoseKind_t inflight_kind;
+    uint8_t inflight_nutrient_index;
+    uint32_t inflight_volume_ul;
 } RecipeController_t;
 
 /* Init controller instance */
@@ -115,13 +131,17 @@ uint8_t recipe_controller_set_targets(RecipeController_t *rc, const RecipeContro
 void recipe_controller_start(RecipeController_t *rc);
 void recipe_controller_stop(RecipeController_t *rc);
 
-/* main_volume_ul is the current main tank volume in uL (for per-liter scaling).
-   If volume is unknown, pass 0 -> controller falls back to absolute steps. */
+/* Produce next requested step based on latest measurements.
+   main_volume_ul: current main tank volume (uL). If unknown, pass 0 to fall back to absolute steps. */
 RecipeStep_t recipe_controller_next_step(RecipeController_t *rc,
                                         int32_t ph_x1000,
                                         int32_t tds_ppm,
                                         uint8_t sensors_fresh,
                                         uint32_t main_volume_ul);
+
+/* Acknowledge step execution result (commit accounting + pending mix update). */
+void recipe_controller_on_dose_result(RecipeController_t *rc,
+                                      uint8_t success);
 
 #ifdef __cplusplus
 }

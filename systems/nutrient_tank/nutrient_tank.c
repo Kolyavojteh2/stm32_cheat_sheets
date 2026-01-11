@@ -609,6 +609,26 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
 
             if (nt_try_start_dose_with_policy(tank, now_ms, &tank->st.active_cmd) == 0U) {
                 tank->st.has_active_cmd = 0U;
+
+                if (tank->st.control_generated_cmd != 0U) {
+                    tank->st.control_generated_cmd = 0U;
+
+                    if (tank->cfg.recipe != NULL) {
+                        recipe_controller_on_dose_result(tank->cfg.recipe, 0U);
+                        recipe_controller_stop(tank->cfg.recipe);
+                    }
+
+                    tank->st.control_active = 0U;
+                    tank->st.last_error = NUTRIENT_TANK_ERR_PUMP_BLOCKED;
+
+                    nt_push_event(tank,
+                                NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                                tank->cfg.main_level.last_volume_ul,
+                                tank->cfg.return_level.last_volume_ul,
+                                tank->st.last_error,
+                                PUMP_GUARD_BLOCK_NONE);
+                }
+
                 return;
             }
 
@@ -671,6 +691,30 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
                                   tank->cfg.return_level.last_volume_ul,
                                   tank->st.last_error,
                                   pump_guard_get_block_reason(guard));
+                }
+
+                if (tank->st.control_generated_cmd != 0U) {
+                    uint8_t success = (pump_guard_get_block_reason(guard) == PUMP_GUARD_BLOCK_NONE) ? 1U : 0U;
+
+                    tank->st.control_generated_cmd = 0U;
+
+                    if (tank->cfg.recipe != NULL) {
+                        recipe_controller_on_dose_result(tank->cfg.recipe, success);
+                    }
+
+                    if (success == 0U) {
+                        if (tank->cfg.recipe != NULL) {
+                            recipe_controller_stop(tank->cfg.recipe);
+                        }
+                        tank->st.control_active = 0U;
+
+                        nt_push_event(tank,
+                                    NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                                    tank->cfg.main_level.last_volume_ul,
+                                    tank->cfg.return_level.last_volume_ul,
+                                    NUTRIENT_TANK_ERR_PUMP_BLOCKED,
+                                    pump_guard_get_block_reason(guard));
+                    }
                 }
 
                 needs_mix = nt_cmd_requires_after_dose_mix(&tank->st.active_cmd);
@@ -857,6 +901,7 @@ static void nt_control_process(NutrientTank_t *tank, uint32_t now_ms)
     /* Push as active command (no queue) */
     tank->st.active_cmd = cmd;
     tank->st.has_active_cmd = 1U;
+    tank->st.control_generated_cmd = 1U;
 
     /* If the upcoming operation is blocked by policy, stop control early. */
     if (tank->st.active_cmd.p.dose.kind == NUTRIENT_TANK_DOSE_DRAIN &&
@@ -1057,6 +1102,8 @@ uint8_t nutrient_tank_submit_command(NutrientTank_t *tank, const NutrientTank_Co
         tank->st.last_error = NUTRIENT_TANK_ERR_BUSY;
         return 0U;
     }
+
+    tank->st.control_generated_cmd = 0U;
 
     tank->st.active_cmd = *cmd;
     tank->st.has_active_cmd = 1U;
