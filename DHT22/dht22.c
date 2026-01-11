@@ -1,133 +1,344 @@
-/*
- * dht22.c
- *
- *  Created on: Aug 3, 2025
- *      Author: vojt
- */
-
 #include "dht22.h"
 
-static TIM_HandleTypeDef *DHT22_timer_handle = NULL;
-static GPIO_TypeDef *DHT22_port = NULL;
-static uint16_t DHT22_pin = -1;
-
-void DHT22_init(TIM_HandleTypeDef *timer_handle, GPIO_TypeDef *data_port, uint16_t data_pin)
+/* Default timings tuned for DHT22 protocol */
+void dht22_default_config(DHT22_Config_t *cfg)
 {
-	DHT22_timer_handle = timer_handle;
+    if (cfg == NULL) {
+        return;
+    }
 
-	DHT22_port = data_port;
-	DHT22_pin = data_pin;
-
-	HAL_TIM_Base_Start(DHT22_timer_handle);
+    cfg->start_low_ms = 2;
+    cfg->response_timeout_us = 200;
+    cfg->bit_timeout_us = 120;
+    cfg->bit_threshold_us = 40;
+    cfg->use_internal_pullup = 1;
 }
 
-static void DHT22_delay(uint16_t delay_us)
+static inline uint32_t dht22_timer_now(const DHT22_t *dev)
 {
-	__HAL_TIM_SET_COUNTER(DHT22_timer_handle, 0);
-	while ((__HAL_TIM_GET_COUNTER(DHT22_timer_handle)) < delay_us);
+    return __HAL_TIM_GET_COUNTER(dev->htim);
 }
 
-static void DHT22_set_pin_input()
+static inline uint32_t dht22_timer_diff_us(const DHT22_t *dev, uint32_t start, uint32_t end)
 {
-	  GPIO_InitTypeDef GPIO_InitStruct = {0};
-	  GPIO_InitStruct.Pin = DHT22_pin;
-	  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	  GPIO_InitStruct.Pull = GPIO_NOPULL;
-	  HAL_GPIO_Init(DHT22_port, &GPIO_InitStruct);
+    if (end >= start) {
+        return end - start;
+    }
+
+    return (dev->timer_period + 1U - start) + end;
 }
 
-
-static void DHT22_set_pin_output()
+static DHT22_Status_t dht22_delay_us(const DHT22_t *dev, uint32_t us)
 {
-	  GPIO_InitTypeDef GPIO_InitStruct = {0};
-	  GPIO_InitStruct.Pin = DHT22_pin;
-	  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	  HAL_GPIO_Init(DHT22_port, &GPIO_InitStruct);
+    uint32_t start;
+    uint32_t now;
+
+    if ((dev == NULL) || (dev->htim == NULL)) {
+        return DHT22_STATUS_ERR_NO_TIMEBASE;
+    }
+
+    start = dht22_timer_now(dev);
+
+    while (1) {
+        now = dht22_timer_now(dev);
+        if (dht22_timer_diff_us(dev, start, now) >= us) {
+            break;
+        }
+    }
+
+    return DHT22_STATUS_OK;
 }
 
-static void DHT22_start()
+static inline GPIO_PinState dht22_line_read(const DHT22_t *dev)
 {
-	DHT22_set_pin_output(DHT22_port, DHT22_pin);               // set the pin as output
-	HAL_GPIO_WritePin(DHT22_port, DHT22_pin, GPIO_PIN_RESET); // pull the pin low
-	DHT22_delay(1200);                                         // wait for > 1ms
-
-	HAL_GPIO_WritePin(DHT22_port, DHT22_pin, GPIO_PIN_SET);   // pull the pin high
-	DHT22_delay (20);                                          // wait for 30us
-//	DHT22_set_pin_input(DHT22_port, DHT22_pin);                // set as input
+    return HAL_GPIO_ReadPin(dev->data_pin.port, dev->data_pin.pin);
 }
 
-static uint8_t DHT22_check_response()
+static inline void dht22_line_write_low(const DHT22_t *dev)
 {
-	DHT22_set_pin_input(DHT22_port, DHT22_pin);         // set as input
-	uint8_t ready = 0;
-	DHT22_delay(40);                                    // wait for 40us
-
-	GPIO_PinState dht22_state = HAL_GPIO_ReadPin(DHT22_port, DHT22_pin);
-	if (dht22_state == GPIO_PIN_RESET)                  // if the pin is low
-	{
-		DHT22_delay(80);                                // wait for 80us
-
-		dht22_state = HAL_GPIO_ReadPin(DHT22_port, DHT22_pin);
-
-		ready = (dht22_state == GPIO_PIN_SET);          // if the pin is high, response is ok
-	}
-
-	while ((HAL_GPIO_ReadPin(DHT22_port, DHT22_pin)) == GPIO_PIN_SET); // wait for the pin to go low
-	return ready;
+    HAL_GPIO_WritePin(dev->data_pin.port, dev->data_pin.pin, GPIO_PIN_RESET);
 }
 
-static uint8_t DHT22_read_byte()
+static inline void dht22_line_write_high(const DHT22_t *dev)
 {
-	uint8_t result;
-	uint8_t data_bit;
-	for (data_bit = 0; data_bit < 8; data_bit++)
-	{
-		while ((HAL_GPIO_ReadPin(DHT22_port, DHT22_pin)) == GPIO_PIN_RESET); // wait for the pin to go high
-		DHT22_delay(40);                                                     // wait for 40 us
-
-		if ((HAL_GPIO_ReadPin(DHT22_port, DHT22_pin)) == GPIO_PIN_RESET)     // if the pin is low
-		{
-			result &= ~(1 << (7 - data_bit)); // write 0
-		}
-		else
-		{
-			result |= (1 << (7 - data_bit));  // write 1
-		}
-
-		while ((HAL_GPIO_ReadPin(DHT22_port, DHT22_pin)) == GPIO_PIN_SET);    // wait for the pin to go low
-	}
-
-	return result;
+    HAL_GPIO_WritePin(dev->data_pin.port, dev->data_pin.pin, GPIO_PIN_SET);
 }
 
-int DHT22_get_data(float *temperature, float *humidity)
+static void dht22_gpio_set_output_od(const DHT22_t *dev)
 {
-	if (DHT22_timer_handle == NULL)
-		return -1;
+    GPIO_InitTypeDef init;
 
-	if (DHT22_port == NULL || DHT22_pin > 16)
-		return -2;
+    init.Pin = dev->data_pin.pin;
+    init.Mode = GPIO_MODE_OUTPUT_OD;
+    init.Pull = (dev->cfg.use_internal_pullup != 0U) ? GPIO_PULLUP : GPIO_NOPULL;
+    init.Speed = GPIO_SPEED_FREQ_LOW;
 
-	DHT22_start();
-	uint8_t ready = DHT22_check_response();
-	if (!ready)
-		return -3;
-
-	uint8_t raw_humidity_high = DHT22_read_byte();
-	uint8_t raw_humidity_low  = DHT22_read_byte();
-
-	uint8_t raw_temperature_high = DHT22_read_byte();
-	uint8_t raw_temperature_low  = DHT22_read_byte();
-
-	DHT22_read_byte(); // ignore check sum
-
-	uint16_t raw_humidity = (raw_humidity_high << 8) | raw_humidity_low;
-	uint16_t raw_temperature = (raw_temperature_high << 8) | raw_temperature_low;
-
-	*humidity = (float)(raw_humidity / 10.0);
-	*temperature = (float)(raw_temperature / 10.0);
-
-	return 0;
+    HAL_GPIO_Init(dev->data_pin.port, &init);
 }
 
+static void dht22_gpio_set_input(const DHT22_t *dev)
+{
+    GPIO_InitTypeDef init;
+
+    init.Pin = dev->data_pin.pin;
+    init.Mode = GPIO_MODE_INPUT;
+    init.Pull = (dev->cfg.use_internal_pullup != 0U) ? GPIO_PULLUP : GPIO_NOPULL;
+    init.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(dev->data_pin.port, &init);
+}
+
+static inline uint32_t dht22_irq_save_disable(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+static inline void dht22_irq_restore(uint32_t primask)
+{
+    if (primask == 0U) {
+        __enable_irq();
+    }
+}
+
+static DHT22_Status_t dht22_wait_for_level(const DHT22_t *dev, GPIO_PinState level, uint32_t timeout_us)
+{
+    uint32_t start;
+    uint32_t now;
+
+    start = dht22_timer_now(dev);
+
+    while (dht22_line_read(dev) != level) {
+        now = dht22_timer_now(dev);
+        if (dht22_timer_diff_us(dev, start, now) >= timeout_us) {
+            return DHT22_STATUS_ERR_TIMEOUT;
+        }
+    }
+
+    return DHT22_STATUS_OK;
+}
+
+static DHT22_Status_t dht22_ensure_timer_started(DHT22_t *dev)
+{
+    HAL_StatusTypeDef st;
+
+    if ((dev == NULL) || (dev->htim == NULL)) {
+        return DHT22_STATUS_ERR_NO_TIMEBASE;
+    }
+
+    if (dev->timer_started != 0U) {
+        return DHT22_STATUS_OK;
+    }
+
+    st = HAL_TIM_Base_Start(dev->htim);
+    if (st != HAL_OK) {
+        return DHT22_STATUS_ERR_HAL;
+    }
+
+    dev->timer_started = 1U;
+    return DHT22_STATUS_OK;
+}
+
+DHT22_Status_t dht22_init(DHT22_t *dev, GPIO_t data_pin, TIM_HandleTypeDef *htim, const DHT22_Config_t *cfg)
+{
+    DHT22_Config_t tmp;
+    DHT22_Status_t st;
+
+    if ((dev == NULL) || (htim == NULL)) {
+        return DHT22_STATUS_ERR_NULL;
+    }
+
+    dev->data_pin = data_pin;
+    dev->htim = htim;
+    dev->timer_period = __HAL_TIM_GET_AUTORELOAD(htim);
+    dev->timer_started = 0U;
+
+    if (cfg != NULL) {
+        dev->cfg = *cfg;
+    } else {
+        dht22_default_config(&tmp);
+        dev->cfg = tmp;
+    }
+
+    st = dht22_ensure_timer_started(dev);
+    if (st != DHT22_STATUS_OK) {
+        return st;
+    }
+
+    /* Put line to idle high via open-drain + pull-up */
+    dht22_gpio_set_output_od(dev);
+    dht22_line_write_high(dev);
+
+    return DHT22_STATUS_OK;
+}
+
+DHT22_Status_t dht22_read_raw(DHT22_t *dev, uint8_t raw[5])
+{
+    uint8_t data[5];
+    uint32_t primask;
+    uint32_t t_start;
+    uint32_t t_end;
+    uint32_t high_us;
+    DHT22_Status_t st;
+    uint8_t byte_idx;
+    uint8_t bit_idx;
+    uint8_t bit_val;
+
+    if ((dev == NULL) || (raw == NULL)) {
+        return DHT22_STATUS_ERR_NULL;
+    }
+
+    st = dht22_ensure_timer_started(dev);
+    if (st != DHT22_STATUS_OK) {
+        return st;
+    }
+
+    data[0] = 0;
+    data[1] = 0;
+    data[2] = 0;
+    data[3] = 0;
+    data[4] = 0;
+
+    /* Host start: drive low >= 1 ms (typical 2 ms) */
+    dht22_gpio_set_output_od(dev);
+    dht22_line_write_low(dev);
+    HAL_Delay(dev->cfg.start_low_ms);
+
+    /*
+     * Timing critical section:
+     *  - release line and sample pulses in microseconds
+     */
+    primask = dht22_irq_save_disable();
+
+    dht22_gpio_set_input(dev);
+    st = dht22_delay_us(dev, 40);
+    if (st != DHT22_STATUS_OK) {
+        dht22_irq_restore(primask);
+        return st;
+    }
+
+    /* Sensor response: LOW ~80 us, HIGH ~80 us, then LOW ~50 us (start bit 0) */
+    st = dht22_wait_for_level(dev, GPIO_PIN_RESET, dev->cfg.response_timeout_us);
+    if (st != DHT22_STATUS_OK) {
+        dht22_irq_restore(primask);
+        return st;
+    }
+
+    st = dht22_wait_for_level(dev, GPIO_PIN_SET, dev->cfg.response_timeout_us);
+    if (st != DHT22_STATUS_OK) {
+        dht22_irq_restore(primask);
+        return st;
+    }
+
+    st = dht22_wait_for_level(dev, GPIO_PIN_RESET, dev->cfg.response_timeout_us);
+    if (st != DHT22_STATUS_OK) {
+        dht22_irq_restore(primask);
+        return st;
+    }
+
+    /* Read 40 bits */
+    for (byte_idx = 0; byte_idx < 5; byte_idx++) {
+        for (bit_idx = 0; bit_idx < 8; bit_idx++) {
+            /* Each bit: LOW ~50 us, then HIGH (26-28 us for 0, ~70 us for 1) */
+
+            st = dht22_wait_for_level(dev, GPIO_PIN_SET, dev->cfg.bit_timeout_us);
+            if (st != DHT22_STATUS_OK) {
+                dht22_irq_restore(primask);
+                return st;
+            }
+
+            t_start = dht22_timer_now(dev);
+
+            st = dht22_wait_for_level(dev, GPIO_PIN_RESET, dev->cfg.bit_timeout_us);
+            if (st != DHT22_STATUS_OK) {
+                dht22_irq_restore(primask);
+                return st;
+            }
+
+            t_end = dht22_timer_now(dev);
+            high_us = dht22_timer_diff_us(dev, t_start, t_end);
+
+            bit_val = (high_us > dev->cfg.bit_threshold_us) ? 1U : 0U;
+
+            data[byte_idx] <<= 1;
+            data[byte_idx] |= (uint8_t)bit_val;
+        }
+    }
+
+    dht22_irq_restore(primask);
+
+    raw[0] = data[0];
+    raw[1] = data[1];
+    raw[2] = data[2];
+    raw[3] = data[3];
+    raw[4] = data[4];
+
+    return DHT22_STATUS_OK;
+}
+
+DHT22_Status_t dht22_read(DHT22_t *dev, DHT22_Data_t *out)
+{
+    uint8_t raw[5];
+    uint8_t sum;
+    uint16_t rh;
+    uint16_t t_u16;
+    int16_t t_x10;
+    DHT22_Status_t st;
+
+    if ((dev == NULL) || (out == NULL)) {
+        return DHT22_STATUS_ERR_NULL;
+    }
+
+    st = dht22_read_raw(dev, raw);
+    if (st != DHT22_STATUS_OK) {
+        return st;
+    }
+
+    sum = (uint8_t)(raw[0] + raw[1] + raw[2] + raw[3]);
+    if (sum != raw[4]) {
+        return DHT22_STATUS_ERR_CHECKSUM;
+    }
+
+    rh = (uint16_t)(((uint16_t)raw[0] << 8) | raw[1]);
+    t_u16 = (uint16_t)(((uint16_t)raw[2] << 8) | raw[3]);
+
+    /* Temperature sign bit is bit15 (MSB of raw[2]) */
+    if ((t_u16 & 0x8000U) != 0U) {
+        t_u16 &= 0x7FFFU;
+        t_x10 = -(int16_t)t_u16;
+    } else {
+        t_x10 = (int16_t)t_u16;
+    }
+
+    out->humidity_x10 = rh;
+    out->temperature_x10 = t_x10;
+
+    out->raw[0] = raw[0];
+    out->raw[1] = raw[1];
+    out->raw[2] = raw[2];
+    out->raw[3] = raw[3];
+    out->raw[4] = raw[4];
+
+    return DHT22_STATUS_OK;
+}
+
+const char *dht22_status_str(DHT22_Status_t status)
+{
+    switch (status) {
+        case DHT22_STATUS_OK:
+            return "OK";
+        case DHT22_STATUS_ERR_NULL:
+            return "NULL";
+        case DHT22_STATUS_ERR_NO_TIMEBASE:
+            return "NO_TIMEBASE";
+        case DHT22_STATUS_ERR_TIMEOUT:
+            return "TIMEOUT";
+        case DHT22_STATUS_ERR_CHECKSUM:
+            return "CHECKSUM";
+        case DHT22_STATUS_ERR_HAL:
+            return "HAL";
+        default:
+            return "UNKNOWN";
+    }
+}
