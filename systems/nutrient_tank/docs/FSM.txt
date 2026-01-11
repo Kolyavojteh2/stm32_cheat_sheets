@@ -1,0 +1,34 @@
+                          +----------------------+
+                          |      STOPPED         |
+                          | (emergency stop)     |
+                          +----------+-----------+
+                                     |
+                                     | reset() / init()
+                                     v
++----------------------+   submit cmd / control step   +----------------------+
+|        IDLE          |------------------------------>|     EXECUTING        |
+| (no active command)  |                               | (pump running)       |
++----------+-----------+                               +----------+-----------+
+           ^                                                      |
+           |                                                      | pump done
+           |                                                      v
+           |                                          +----------------------+
+           |                                          |  (optional) AERATE   |
+           |                                          | after_dose_aerate_ms |
+           |                                          +----------+-----------+
+           |                                                     |
+           |                                                     | time reached
+           |                                                     v
+           |                                          +----------------------+
+           |                                          |    WAIT_SETTLE       |
+           |                                          | after_dose_settle_ms |
+           |                                          +----------+-----------+
+           |                                                     |
+           |                                                     | time reached
+           |                                                     v
+           +-----------------------------------------------------+
+                         back to IDLE
+
+Notes:
+- Some commands may skip AERATE/WAIT_SETTLE -> return directly to IDLE.
+- control mode injects DOSE commands only when IDLE and no inflight step.
