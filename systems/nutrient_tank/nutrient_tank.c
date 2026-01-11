@@ -717,6 +717,34 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
                     }
                 }
 
+                if (tank->st.control_generated_cmd != 0U) {
+
+                    uint8_t success = (pump_guard_get_block_reason(guard) == PUMP_GUARD_BLOCK_NONE) ? 1U : 0U;
+
+                    tank->st.control_generated_cmd = 0U;
+
+                    if (tank->cfg.recipe != NULL) {
+                        recipe_controller_on_dose_result(tank->cfg.recipe, success);
+                    }
+
+                    if (success != 0U) {
+                        /* Gate will be activated when tank returns to IDLE (after settle). */
+                        tank->st.control_measurement_arm = 1U;
+                    } else {
+                        if (tank->cfg.recipe != NULL) {
+                            recipe_controller_stop(tank->cfg.recipe);
+                        }
+                        tank->st.control_active = 0U;
+
+                        nt_push_event(tank,
+                                    NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                                    tank->cfg.main_level.last_volume_ul,
+                                    tank->cfg.return_level.last_volume_ul,
+                                    NUTRIENT_TANK_ERR_PUMP_BLOCKED,
+                                    pump_guard_get_block_reason(guard));
+                    }
+                }
+
                 needs_mix = nt_cmd_requires_after_dose_mix(&tank->st.active_cmd);
 
                 if (needs_mix != 0U && tank->cfg.air != NULL &&
@@ -745,6 +773,13 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
                 /* No mixing requested -> done */
                 tank->st.has_active_cmd = 0U;
                 tank->st.state = NUTRIENT_TANK_STATE_IDLE;
+
+                if (tank->st.control_measurement_arm != 0U) {
+                    tank->st.control_measurement_after_ms = now_ms;
+                    tank->st.control_wait_measurement = 1U;
+                    tank->st.control_measurement_arm = 0U;
+                    tank->st.control_wait_started_at_ms = now_ms;
+                }
             }
 
             return;
@@ -780,6 +815,13 @@ static void nt_handle_active_command(NutrientTank_t *tank, uint32_t now_ms)
         if (nt_time_reached(now_ms, tank->st.wait_until_ms) != 0U) {
             tank->st.has_active_cmd = 0U;
             tank->st.state = NUTRIENT_TANK_STATE_IDLE;
+
+            if (tank->st.control_measurement_arm != 0U) {
+                tank->st.control_measurement_after_ms = now_ms;
+                tank->st.control_wait_measurement = 1U;
+                tank->st.control_measurement_arm = 0U;
+                tank->st.control_wait_started_at_ms = now_ms;
+            }
         }
 
         return;
@@ -833,6 +875,59 @@ static void nt_control_process(NutrientTank_t *tank, uint32_t now_ms)
     if (tank->st.state != NUTRIENT_TANK_STATE_IDLE || tank->st.has_active_cmd != 0U) {
         return;
     }
+
+    {
+        uint8_t need_ph = tank->cfg.recipe->targets.enable_ph;
+        uint8_t need_tds = tank->cfg.recipe->targets.enable_tds;
+
+        if (tank->st.control_wait_measurement != 0U) {
+
+            /* Timeout protection for waiting new measurements */
+            if (tank->cfg.timing.control_measurement_timeout_ms != 0U) {
+                uint32_t deadline_ms = tank->st.control_wait_started_at_ms + tank->cfg.timing.control_measurement_timeout_ms;
+
+                if (nt_time_reached(now_ms, deadline_ms) != 0U) {
+
+                    if (tank->cfg.recipe != NULL) {
+                        recipe_controller_stop(tank->cfg.recipe);
+                    }
+
+                    tank->st.control_active = 0U;
+                    tank->st.control_wait_measurement = 0U;
+                    tank->st.control_measurement_arm = 0U;
+                    tank->st.control_measurement_after_ms = 0U;
+                    tank->st.control_wait_started_at_ms = 0U;
+
+                    tank->st.last_error = NUTRIENT_TANK_ERR_TIMEOUT;
+
+                    nt_push_event(tank,
+                                NUTRIENT_TANK_EVENT_CONTROL_ERROR,
+                                tank->cfg.main_level.last_volume_ul,
+                                tank->cfg.return_level.last_volume_ul,
+                                tank->st.last_error,
+                                PUMP_GUARD_BLOCK_NONE);
+
+                    return;
+                }
+            }
+
+            if (tank_sensors_are_fresh(tank->cfg.sensors, now_ms, 0U, need_ph, need_tds) == 0U) {
+                return;
+            }
+
+            if (tank_sensors_are_newer_than(tank->cfg.sensors,
+                                            tank->st.control_measurement_after_ms,
+                                            0U,
+                                            need_ph,
+                                            need_tds) == 0U) {
+                return;
+            }
+
+            tank->st.control_wait_measurement = 0U;
+            tank->st.control_wait_started_at_ms = 0U;
+        }
+    }
+
 
     step = recipe_controller_next_step(tank->cfg.recipe,
                                        tank->cfg.sensors->ph_x1000.value,
@@ -945,6 +1040,11 @@ uint8_t nutrient_tank_init(NutrientTank_t *tank,
     tank->st.return_level_state = NUTRIENT_TANK_LEVEL_OK;
 
     tank->st.control_active = 0U;
+    tank->st.control_generated_cmd = 0U;
+    tank->st.control_measurement_arm = 0U;
+    tank->st.control_wait_measurement = 0U;
+    tank->st.control_measurement_after_ms = 0U;
+    tank->st.control_wait_started_at_ms = 0U;
 
     tank->st.ev_wr = 0U;
     tank->st.ev_rd = 0U;
@@ -981,6 +1081,11 @@ void nutrient_tank_reset(NutrientTank_t *tank)
         recipe_controller_stop(tank->cfg.recipe);
     }
     tank->st.control_active = 0U;
+    tank->st.control_generated_cmd = 0U;
+    tank->st.control_measurement_arm = 0U;
+    tank->st.control_wait_measurement = 0U;
+    tank->st.control_measurement_after_ms = 0U;
+    tank->st.control_wait_started_at_ms = 0U;
 
     tank->st.ev_wr = 0U;
     tank->st.ev_rd = 0U;
@@ -1043,6 +1148,11 @@ uint8_t nutrient_tank_submit_command(NutrientTank_t *tank, const NutrientTank_Co
             recipe_controller_stop(tank->cfg.recipe);
         }
         tank->st.control_active = 0U;
+        tank->st.control_generated_cmd = 0U;
+        tank->st.control_measurement_arm = 0U;
+        tank->st.control_wait_measurement = 0U;
+        tank->st.control_measurement_after_ms = 0U;
+        tank->st.control_wait_started_at_ms = 0U;
 
         /* Cancel current operation but keep circulation state */
         tank->st.has_active_cmd = 0U;
@@ -1206,6 +1316,11 @@ void nutrient_tank_emergency_stop(NutrientTank_t *tank)
         recipe_controller_stop(tank->cfg.recipe);
     }
     tank->st.control_active = 0U;
+    tank->st.control_generated_cmd = 0U;
+    tank->st.control_measurement_arm = 0U;
+    tank->st.control_wait_measurement = 0U;
+    tank->st.control_measurement_after_ms = 0U;
+    tank->st.control_wait_started_at_ms = 0U;
 
     tank->st.state = NUTRIENT_TANK_STATE_STOPPED;
     tank->st.last_error = NUTRIENT_TANK_ERR_NONE;

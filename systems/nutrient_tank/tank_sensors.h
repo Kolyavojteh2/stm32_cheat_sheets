@@ -48,6 +48,13 @@ uint8_t tank_sensors_are_fresh(const TankSensors_t *s,
                                uint8_t need_ph,
                                uint8_t need_tds);
 
+/* Checks whether required sensor values were updated_at_ms >= after_ms */
+uint8_t tank_sensors_are_newer_than(const TankSensors_t *s,
+                                    uint32_t after_ms,
+                                    uint8_t need_temperature,
+                                    uint8_t need_ph,
+                                    uint8_t need_tds);
+
 #ifdef __cplusplus
 }
 #endif

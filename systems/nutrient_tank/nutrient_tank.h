@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
 #include "pump_guard.h"
 #include "tank_sensors.h"
 #include "recipe_controller.h"
@@ -69,6 +70,9 @@ typedef struct
 
     /* After explicit aeration command */
     uint32_t after_aerate_settle_ms;
+
+    /* Max time to wait for new sensor measurement after settle (0 disables timeout) */
+    uint32_t control_measurement_timeout_ms;
 } NutrientTank_Timing_t;
 
 typedef enum
@@ -251,6 +255,16 @@ typedef struct
 
     uint8_t control_active;
     uint8_t control_generated_cmd;
+
+    /* Arm gate after successful control dose; gate activates when tank becomes IDLE */
+    uint8_t control_measurement_arm;
+
+    /* While set, controller waits for sensor update after control_measurement_after_ms */
+    uint8_t control_wait_measurement;
+    uint32_t control_measurement_after_ms;
+
+    /* Timestamp when waiting for new measurement started */
+    uint32_t control_wait_started_at_ms;
 
     /* Simple ring-buffer for events */
     uint8_t ev_wr;

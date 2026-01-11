@@ -116,3 +116,49 @@ uint8_t tank_sensors_are_fresh(const TankSensors_t *s,
 
     return 1U;
 }
+
+static uint8_t ts_is_newer_or_equal(uint32_t updated_at_ms, uint32_t after_ms)
+{
+    /* Wrap-safe comparison for monotonic ticks */
+    return (((int32_t)(updated_at_ms - after_ms)) >= 0) ? 1U : 0U;
+}
+
+uint8_t tank_sensors_are_newer_than(const TankSensors_t *s,
+                                    uint32_t after_ms,
+                                    uint8_t need_temperature,
+                                    uint8_t need_ph,
+                                    uint8_t need_tds)
+{
+    if (s == NULL) {
+        return 0U;
+    }
+
+    if (need_temperature != 0U) {
+        if (s->temperature_mC.valid == 0U) {
+            return 0U;
+        }
+        if (ts_is_newer_or_equal(s->temperature_mC.updated_at_ms, after_ms) == 0U) {
+            return 0U;
+        }
+    }
+
+    if (need_ph != 0U) {
+        if (s->ph_x1000.valid == 0U) {
+            return 0U;
+        }
+        if (ts_is_newer_or_equal(s->ph_x1000.updated_at_ms, after_ms) == 0U) {
+            return 0U;
+        }
+    }
+
+    if (need_tds != 0U) {
+        if (s->tds_ppm.valid == 0U) {
+            return 0U;
+        }
+        if (ts_is_newer_or_equal(s->tds_ppm.updated_at_ms, after_ms) == 0U) {
+            return 0U;
+        }
+    }
+
+    return 1U;
+}
